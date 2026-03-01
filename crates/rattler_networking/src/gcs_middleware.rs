@@ -1,5 +1,6 @@
 //! Middleware to handle `gcs://` URLs to pull artifacts from an GCS
-use std::sync::{Arc, Weak};
+use std::pin::Pin;
+use std::sync::{Arc, Mutex, Weak};
 
 use async_trait::async_trait;
 use google_cloud_auth::credentials::{
@@ -7,7 +8,7 @@ use google_cloud_auth::credentials::{
 };
 use reqwest::{Request, Response};
 use reqwest_middleware::{Middleware, Next, Result as MiddlewareResult};
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::Notify;
 use url::Url;
 
 /// The auth headers and the `EntityTag` assigned by the credential library.
@@ -60,6 +61,32 @@ struct GCSInner {
 #[derive(Clone)]
 pub struct GCSMiddleware {
     inner: Arc<GCSInner>,
+}
+
+/// Outcome of a single synchronous inspection of the token cache.
+///
+/// Returned by [`GCSMiddleware::poll_cache`], which holds and releases the
+/// `std::sync::Mutex` entirely within a non-`async` context.  This ensures
+/// that no `MutexGuard` ever appears in the state machine of the surrounding
+/// `async fn`, keeping the future `Send`.
+enum PollResult<'a> {
+    /// A refresh is in flight.  The contained future has already been enabled
+    /// (via [`tokio::sync::futures::Notified::enable`]) while the lock was
+    /// held, so awaiting it cannot miss the completion signal.
+    Wait(Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>>),
+    /// The previous refresher was cancelled; the cache has been reset to
+    /// [`CacheState::Empty`].  The caller should loop immediately.
+    Retry,
+    /// A cached token is available.  The caller should validate it with the
+    /// credential library (no lock held).
+    Validate {
+        entity_tag: EntityTag,
+        headers: http::HeaderMap,
+    },
+    /// The cache was empty and the caller has claimed the refresh slot.  The
+    /// contained `Arc` is the liveness token; its `Weak` counterpart is now
+    /// stored in [`CacheState::Refreshing`].
+    StartRefresh(Arc<()>),
 }
 
 impl Default for GCSMiddleware {
@@ -126,7 +153,7 @@ impl GCSMiddleware {
     /// Lazily initialise the `Credentials` object (once per middleware
     /// lifetime) and return a cheap `Arc`-clone of it.
     async fn get_credential(&self) -> MiddlewareResult<Credentials> {
-        let mut guard = self.inner.credential.lock().await;
+        let mut guard = self.inner.credential.lock().unwrap();
         if guard.is_none() {
             let scopes = ["https://www.googleapis.com/auth/devstorage.read_only"];
             let c = AccessTokenCredentialBuilder::default()
@@ -137,6 +164,65 @@ impl GCSMiddleware {
         }
         // Credentials is Arc-backed; clone is a cheap refcount bump.
         Ok(guard.as_ref().unwrap().clone())
+    }
+
+    /// Inspect and (if necessary) update the token cache under the lock, then
+    /// return a [`PollResult`] describing what the caller should do next.
+    ///
+    /// This is a plain (`!async`) function so that the `std::sync::MutexGuard`
+    /// is created and dropped entirely within synchronous code.  The guard
+    /// never appears in an `async` state machine, keeping every future that
+    /// calls this method `Send`.
+    ///
+    /// ## Liveness-token protocol
+    ///
+    /// `mem::replace` takes ownership of the current state before any match
+    /// arm runs, so no pattern binding borrows from `guard`.  This avoids the
+    /// borrow-checker cycle that would otherwise prevent re-assigning `*guard`
+    /// inside the same match.
+    fn poll_cache<'a>(&'a self) -> PollResult<'a> {
+        let mut guard = self.inner.cache.lock().unwrap();
+
+        // Take ownership of the state, leaving a harmless placeholder.
+        // Every arm below restores or updates `*guard` before releasing it.
+        let state = std::mem::replace(&mut *guard, CacheState::Empty);
+
+        match state {
+            // ── Refreshing (live) ────────────────────────────────────────────
+            // Put the state back, subscribe to the completion signal while the
+            // lock is still held (so we cannot miss `notify_waiters()`), then
+            // release the lock.
+            CacheState::Refreshing(weak) if weak.upgrade().is_some() => {
+                *guard = CacheState::Refreshing(weak);
+                let mut notified = Box::pin(self.inner.refresh_done.notified());
+                notified.as_mut().enable();
+                drop(guard);
+                PollResult::Wait(notified)
+            }
+
+            // ── Refreshing (cancelled) ───────────────────────────────────────
+            // The Arc that backs the Weak is gone.  Leave the cache as Empty
+            // (the placeholder set by `mem::replace`) so the caller can retry.
+            CacheState::Refreshing(_dead) => PollResult::Retry,
+
+            // ── Ready ────────────────────────────────────────────────────────
+            // Clone the cached values, restore the state, then tell the caller
+            // to validate the token without the lock.
+            CacheState::Ready(r) => {
+                let entity_tag = r.entity_tag.clone();
+                let headers = r.headers.clone();
+                *guard = CacheState::Ready(r);
+                PollResult::Validate { entity_tag, headers }
+            }
+
+            // ── Empty ────────────────────────────────────────────────────────
+            // Claim the refresh slot atomically under the lock.
+            CacheState::Empty => {
+                let token = Arc::new(());
+                *guard = CacheState::Refreshing(Arc::downgrade(&token));
+                PollResult::StartRefresh(token)
+            }
+        }
     }
 
     /// Return cached auth headers, refreshing exactly once when necessary.
@@ -166,116 +252,87 @@ impl GCSMiddleware {
     /// `.await` point, the `Arc` is released, making the `Weak` dead.
     ///
     /// Any waiter or new caller that subsequently observes `Refreshing(dead)`
-    /// resets the state to `Empty` itself (no lock-free CAS or async
-    /// coordination needed — it simply holds the mutex) and retries.  The
-    /// `Drop` impl of [`RefreshGuard`] only needs to call `notify_waiters()`
-    /// to wake existing waiters; it never needs to acquire the mutex.
+    /// resets the state to `Empty` itself and retries.  The `Drop` impl of
+    /// [`RefreshGuard`] calls `notify_waiters()` to wake existing waiters
+    /// without needing to acquire the mutex.
     async fn get_or_refresh_token(&self) -> MiddlewareResult<http::HeaderMap> {
         loop {
-            let mut guard = self.inner.cache.lock().await;
-
-            // ── Arm 1: another task is fetching – wait for it ───────────────
-            if let CacheState::Refreshing(weak_token) = &*guard {
-                if let Some(_strong) = weak_token.upgrade() {
-                    // Refresher is alive: subscribe before releasing the lock so
-                    // we cannot miss a `notify_waiters()` call that arrives
-                    // between `drop(guard)` and `notified.await`.
-                    let notified = self.inner.refresh_done.notified();
-                    let mut notified = std::pin::pin!(notified);
-                    notified.as_mut().enable();
-                    drop(guard); // release lock before suspending
+            // `poll_cache` is synchronous: the MutexGuard is acquired and
+            // dropped entirely inside it, so it never appears in this async
+            // state machine.  All variants of `PollResult` are `Send`.
+            match self.poll_cache() {
+                // ── Wait ─────────────────────────────────────────────────────
+                // The contained future was already enabled while the lock was
+                // held; awaiting it is race-free.
+                PollResult::Wait(notified) => {
                     notified.await;
-                    continue; // re-inspect state
-                } else {
-                    // Refresher was cancelled (Arc dropped → Weak is dead).
-                    // Reset to Empty so the next loop iteration can retry.
-                    *guard = CacheState::Empty;
-                    drop(guard);
-                    continue;
                 }
-            }
 
-            // ── Arm 2: cache is populated – validate via ETag ───────────────
-            // Clone the cached values while the lock is held; the borrow ends
-            // before we call `drop(guard)` so the compiler is satisfied.
-            let cached = match &*guard {
-                CacheState::Ready(r) => Some((r.entity_tag.clone(), r.headers.clone())),
-                _ => None,
-            };
-            if let Some((entity_tag, headers)) = cached {
-                drop(guard); // release lock before the network round-trip
+                // ── Retry ────────────────────────────────────────────────────
+                // Refresher was cancelled; loop to claim the slot ourselves.
+                PollResult::Retry => {}
 
-                let cred = self.get_credential().await?;
-                let mut ext = http::Extensions::new();
-                ext.insert(entity_tag);
+                // ── Validate ─────────────────────────────────────────────────
+                // Check whether the cached token is still current.
+                PollResult::Validate { entity_tag, headers } => {
+                    let cred = self.get_credential().await?;
+                    let mut ext = http::Extensions::new();
+                    ext.insert(entity_tag);
 
-                return match cred
-                    .headers(ext)
-                    .await
-                    .map_err(|e| reqwest_middleware::Error::Middleware(anyhow::Error::new(e)))?
-                {
-                    // Library confirms our token is still current.
-                    CacheableResource::NotModified => Ok(headers),
-                    // Library silently refreshed the token; update our cache.
-                    CacheableResource::New { entity_tag, data } => {
-                        *self.inner.cache.lock().await = CacheState::Ready(CachedResource {
-                            entity_tag,
-                            headers: data.clone(),
-                        });
-                        Ok(data)
+                    return match cred
+                        .headers(ext)
+                        .await
+                        .map_err(|e| reqwest_middleware::Error::Middleware(anyhow::Error::new(e)))?
+                    {
+                        CacheableResource::NotModified => Ok(headers),
+                        CacheableResource::New { entity_tag, data } => {
+                            *self.inner.cache.lock().unwrap() = CacheState::Ready(CachedResource {
+                                entity_tag,
+                                headers: data.clone(),
+                            });
+                            Ok(data)
+                        }
+                    };
+                }
+
+                // ── StartRefresh ──────────────────────────────────────────────
+                // We claimed the slot; perform the fetch and update the cache.
+                PollResult::StartRefresh(token) => {
+                    let mut refresh_guard = RefreshGuard {
+                        inner: Arc::clone(&self.inner),
+                        _token: token,
+                        defused: false,
+                    };
+
+                    let cred = self.get_credential().await?;
+                    let fetch = cred
+                        .headers(http::Extensions::new())
+                        .await
+                        .map_err(|e| reqwest_middleware::Error::Middleware(anyhow::Error::new(e)));
+
+                    match fetch {
+                        Ok(CacheableResource::New { entity_tag, data }) => {
+                            let out = data.clone();
+                            *self.inner.cache.lock().unwrap() = CacheState::Ready(CachedResource {
+                                entity_tag,
+                                headers: data,
+                            });
+                            refresh_guard.defused = true;
+                            self.inner.refresh_done.notify_waiters();
+                            return Ok(out);
+                        }
+                        // We passed no ETag, so `NotModified` is impossible.
+                        Ok(CacheableResource::NotModified) => unreachable!(
+                            "no entity tag was provided in extensions, \
+                             so NotModified cannot be returned"
+                        ),
+                        Err(e) => {
+                            *self.inner.cache.lock().unwrap() = CacheState::Empty;
+                            refresh_guard.defused = true;
+                            self.inner.refresh_done.notify_waiters();
+                            return Err(e);
+                        }
                     }
-                };
-            }
-
-            // ── Arm 3: cache is empty – claim the refresh slot ──────────────
-            // At this point `*guard` must be `Empty` (the `Refreshing` and
-            // `Ready` arms above have already handled the other cases).
-            //
-            // Create a liveness token.  The strong `Arc` is stored in the
-            // `RefreshGuard`; a `Weak` clone goes into the cache state.  If
-            // this task is cancelled, the `Arc` drops (via `RefreshGuard::Drop`)
-            // and the `Weak` becomes dead, signalling cancellation to any
-            // waiter that wakes up.
-            let token = Arc::new(());
-            *guard = CacheState::Refreshing(Arc::downgrade(&token));
-            drop(guard); // release lock before the network round-trip
-
-            let mut refresh_guard = RefreshGuard {
-                inner: Arc::clone(&self.inner),
-                _token: token,
-                defused: false,
-            };
-
-            let fetch = async {
-                let cred = self.get_credential().await?;
-                cred.headers(http::Extensions::new())
-                    .await
-                    .map_err(|e| reqwest_middleware::Error::Middleware(anyhow::Error::new(e)))
-            }
-            .await;
-
-            match fetch {
-                Ok(CacheableResource::New { entity_tag, data }) => {
-                    let out = data.clone();
-                    *self.inner.cache.lock().await = CacheState::Ready(CachedResource {
-                        entity_tag,
-                        headers: data,
-                    });
-                    refresh_guard.defused = true;
-                    self.inner.refresh_done.notify_waiters();
-                    return Ok(out);
-                }
-                // We passed no ETag, so `NotModified` is impossible.
-                Ok(CacheableResource::NotModified) => unreachable!(
-                    "no entity tag was provided in extensions, \
-                     so NotModified cannot be returned"
-                ),
-                Err(e) => {
-                    // Reset to Empty so the next caller can retry.
-                    *self.inner.cache.lock().await = CacheState::Empty;
-                    refresh_guard.defused = true;
-                    self.inner.refresh_done.notify_waiters();
-                    return Err(e);
                 }
             }
         }
